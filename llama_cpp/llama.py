@@ -941,6 +941,8 @@ class Llama:
 
         finish_reason = "length"
         multibyte_fix = 0
+        buffered_tokens = []
+
         for token in self.generate(
             prompt_tokens,
             top_k=top_k,
@@ -991,6 +993,24 @@ class Llama:
                 remaining_text = self.detokenize(remaining_tokens)
                 remaining_length = len(remaining_text)
 
+                if buffered_tokens:
+                    # Handle case where we still have multibyte tokens to flush from prev cycle
+                    yield {
+                            "id": completion_id,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [
+                                {
+                                    "text": self.detokenize(buffered_tokens).decode("utf-8", errors="ignore"),
+                                    "index": 0,
+                                    "logprobs": None,
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                    buffered_tokens = []
+
                 # We want to avoid yielding any characters from
                 # the generated text if they are part of a stop
                 # sequence.
@@ -1004,7 +1024,7 @@ class Llama:
 
                 token_end_position = 0
                 for token in remaining_tokens:
-                    token_end_position += len(self.detokenize([token]))
+                    token_end_position += len(self.detokenize([token])) - 1
                     # Check if stop sequence is in the token
                     if token_end_position >= (remaining_length - first_stop_position):
                         break
@@ -1042,7 +1062,62 @@ class Llama:
                             "token_logprobs": [current_logprobs[int(token)]],
                             "top_logprobs": [top_logprob],
                         }
-                    returned_tokens += 1
+                    
+                    returned_tokens += 1  
+
+                    de_tokenized = int.from_bytes(self.detokenize([token]), sys.byteorder)
+
+                    if de_tokenized & 0b11000000 == 0b11000000:
+                        # Start of a multibyte sequence
+
+                        if buffered_tokens:
+                            # Handle edge case where we have subsequent multibyte generated
+                            print('Empty buffer - went from one unicode to next')
+                            yield {
+                                "id": completion_id,
+                                "object": "text_completion",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [
+                                    {
+                                        "text": self.detokenize(buffered_tokens).decode("utf-8", errors="ignore"),
+                                        "index": 0,
+                                        "logprobs": None,
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            buffered_tokens = []
+
+                        buffered_tokens.append(token)
+                        continue
+                    elif de_tokenized & 0b10000000 == 0b10000000:
+                        # continuation of a multibyte sequence
+                        print('Hit a continuation')
+                        buffered_tokens.append(token)
+                        continue
+
+                    # Handle standard tokens
+
+                    if buffered_tokens:
+                        # Assume multibyte sequence has ended so flush buffer
+                        print('Hit a normal token, empty buffer')
+                        yield {
+                            "id": completion_id,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [
+                                {
+                                    "text": self.detokenize(buffered_tokens).decode("utf-8", errors="ignore"),
+                                    "index": 0,
+                                    "logprobs": None,
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        buffered_tokens = []
+
                     yield {
                         "id": completion_id,
                         "object": "text_completion",
@@ -1064,6 +1139,22 @@ class Llama:
                 text = self.detokenize(completion_tokens)
                 finish_reason = "length"
                 break
+
+        if buffered_tokens:
+            yield {
+                "id": completion_id,
+                "object": "text_completion",
+                "created": created,
+                "model": model_name,
+                "choices": [
+                    {
+                        "text": self.detokenize(buffered_tokens).decode("utf-8", errors="ignore"),
+                        "index": 0,
+                        "logprobs": None,
+                        "finish_reason": None,
+                    }
+                ],
+            }
 
         if stopping_criteria is not None and stopping_criteria(
             self._input_ids.tolist(), self._scores[-1, :].tolist()
